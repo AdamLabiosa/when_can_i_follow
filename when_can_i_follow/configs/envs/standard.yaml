@@ -1,7 +1,5 @@
 # @package env
-name: follower
+name: standard
 kwargs:
-  adversary_speed: 0.3   # probability per step that the adversary takes one step
   plan_delay: 3          # timesteps between requesting and receiving a plan
-  min_spawn_dist: 5      # minimum Manhattan distance from the agent at spawn
   door_shift_prob: 0.1   # per-door probability of moving to a random position on that wall

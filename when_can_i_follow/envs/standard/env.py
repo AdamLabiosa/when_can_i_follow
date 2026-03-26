@@ -3,9 +3,8 @@ import heapq
 import gymnasium as gym
 import numpy as np
 from minigrid.core.constants import OBJECT_TO_IDX, COLOR_TO_IDX
-from minigrid.core.world_object import Ball, Wall
+from minigrid.core.world_object import Wall
 from minigrid.envs.fourrooms import FourRoomsEnv as baseFourRoomsEnv
-from minigrid.utils.rendering import fill_coords, point_in_circle
 
 # Direction vectors indexed by MiniGrid dir encoding: right, down, left, up
 _DIR_VECS = [(1, 0), (0, 1), (-1, 0), (0, -1)]
@@ -21,25 +20,8 @@ _PATH_COLOR_RGB = np.array([30, 144, 255], dtype=np.float32)  # dodger blue
 _PATH_ALPHA = 0.45
 
 
-class _Adversary(Ball):
-    """A red ball that can be overlapped so the agent can walk into it (collision handled manually)."""
-
-    def __init__(self):
-        super().__init__(color="red")
-
-    def can_overlap(self) -> bool:
-        return True
-
-    def render(self, img):
-        fill_coords(img, point_in_circle(0.5, 0.5, 0.31), (220, 30, 30))
-
-
-class followerEnv(baseFourRoomsEnv):
-    """Four-rooms env with a pursuing adversary that starts in the agent's room.
-
-    The adversary moves toward the agent with probability ``adversary_speed`` each
-    timestep, taking one step along the longer Manhattan-distance axis (random if
-    equal).  Touching the adversary ends the episode with reward 0.
+class standardEnv(baseFourRoomsEnv):
+    """Four-rooms env with plan-on-demand, without any adversary.
 
     Actions:
         0 — turn left
@@ -55,18 +37,12 @@ class followerEnv(baseFourRoomsEnv):
 
     def __init__(
         self,
-        adversary_speed: float = 0.5,
         plan_delay: int = 3,
-        min_spawn_dist: int = 0,
         door_shift_prob: float = 0.0,
         *args,
         **kwargs,
     ):
-        self.adversary_speed = adversary_speed
-        self.min_spawn_dist = min_spawn_dist
         self.door_shift_prob = door_shift_prob
-        self.adversary_pos: tuple[int, int] | None = None
-        self._adversary_obj = _Adversary()
 
         # Plan state — initialised properly in reset()
         self._goal_pos: tuple[int, int] = (0, 0)
@@ -89,20 +65,11 @@ class followerEnv(baseFourRoomsEnv):
             "image": _image_space,
             "plan_computing": gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
             "plan_ready": gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
-            # "adversary_dist": gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
         })
-        # Max possible Manhattan distance within the walkable interior
-        self._max_dist = float(self.width + self.height - 4)
 
         self.max_steps = 200
 
     def _make_obs(self, image: np.ndarray) -> dict:
-        if self.adversary_pos is not None:
-            ax, ay = self.adversary_pos
-            px, py = int(self.agent_pos[0]), int(self.agent_pos[1])
-            dist = (abs(ax - px) + abs(ay - py)) / self._max_dist
-        else:
-            dist = 1.0
         return {
             "image": image,
             "plan_computing": np.array(
@@ -111,87 +78,10 @@ class followerEnv(baseFourRoomsEnv):
             "plan_ready": np.array(
                 [1.0 if self.plan_path else 0.0], dtype=np.float32
             ),
-            # "adversary_dist": np.array([dist], dtype=np.float32),
         }
-
-    def _agent_room(self) -> tuple[bool, bool]:
-        """Return (is_left, is_top) for the room the agent currently occupies."""
-        ax, ay = int(self.agent_pos[0]), int(self.agent_pos[1])
-        return ax < self.width // 2, ay < self.height // 2
-
-    def _free_cells_in_room(self, is_left: bool, is_top: bool) -> list[tuple[int, int]]:
-        """Return all empty floor cells in the specified room."""
-        room_w = self.width // 2
-        room_h = self.height // 2
-        x_range = range(1, room_w) if is_left else range(room_w + 1, self.width - 1)
-        y_range = range(1, room_h) if is_top else range(room_h + 1, self.height - 1)
-        return [
-            (x, y)
-            for x in x_range
-            for y in y_range
-            if self.grid.get(x, y) is None
-        ]
-
-    def _move_adversary(self) -> None:
-        """Step the adversary one cell closer to the agent (if speed check passes)."""
-        if self.adversary_pos is None:
-            return
-        if self.np_random.random() > self.adversary_speed:
-            return
-
-        ax, ay = self.adversary_pos
-        px, py = int(self.agent_pos[0]), int(self.agent_pos[1])
-        dx, dy = px - ax, py - ay
-
-        if dx == 0 and dy == 0:
-            return
-
-        # Build ordered list of candidate moves: prefer longer axis
-        if abs(dx) > abs(dy):
-            candidates = [(int(np.sign(dx)), 0)]
-            if dy != 0:
-                candidates.append((0, int(np.sign(dy))))
-        elif abs(dy) > abs(dx):
-            candidates = [(0, int(np.sign(dy)))]
-            if dx != 0:
-                candidates.append((int(np.sign(dx)), 0))
-        else:
-            # Equal distance on both axes — pick randomly
-            opts = [(int(np.sign(dx)), 0), (0, int(np.sign(dy)))]
-            if self.np_random.random() < 0.5:
-                opts = opts[::-1]
-            candidates = opts
-
-        # Remove adversary from grid while we attempt the move
-        self.grid.set(ax, ay, None)
-
-        new_pos = (ax, ay)  # default: stay put
-        for mdx, mdy in candidates:
-            nx, ny = ax + mdx, ay + mdy
-            cell = self.grid.get(nx, ny)
-            # Walkable if empty OR the cell is the agent's position
-            if cell is None or (nx, ny) == (px, py):
-                new_pos = (nx, ny)
-                break
-
-        self.adversary_pos = new_pos
-        # Only re-place if not on the agent's cell (collision handled separately)
-        if self.adversary_pos != (px, py):
-            self.grid.set(*self.adversary_pos, self._adversary_obj)
-
-    def _caught(self) -> bool:
-        return self.adversary_pos is not None and self.adversary_pos == tuple(
-            int(v) for v in self.agent_pos
-        )
 
     def step(self, action):
         self.time += 1
-
-        # Adversary moves first
-        self._move_adversary()
-        if self._caught():
-            image_obs = self.gen_obs()["image"]
-            return self._make_obs(image_obs), 0.0, True, False, {"caught": True}
 
         # Deliver delayed plan if the wait is over
         if self.plan_started_at is not None and self.time - self.plan_started_at >= self.plan_delay:
@@ -221,16 +111,11 @@ class followerEnv(baseFourRoomsEnv):
         obs, reward, terminated, truncated, info = super().step(action)
         image = obs["image"]
 
-        # Agent might walk into the adversary
-        if self._caught():
-            return self._make_obs(image), 0.0, True, False, {"caught": True}
-
         truncated = truncated or self.time >= self.max_steps
         return self._make_obs(image), reward, terminated, truncated, info
 
     def reset(self, *args, **kwargs):
         self.time = 0
-        self.adversary_pos = None
         self.plan = None
         self.plan_path = []
         self.plan_request_pos = None
@@ -246,20 +131,6 @@ class followerEnv(baseFourRoomsEnv):
             for y in range(self.height)
             if (cell := self.grid.get(x, y)) is not None and cell.type == "goal"
         )
-
-        # Spawn adversary in the same room as the agent, on an empty cell
-        is_left, is_top = self._agent_room()
-        agent_cell = (int(self.agent_pos[0]), int(self.agent_pos[1]))
-        candidates = [
-            c for c in self._free_cells_in_room(is_left, is_top)
-            if c != agent_cell
-            and abs(c[0] - agent_cell[0]) + abs(c[1] - agent_cell[1]) >= self.min_spawn_dist
-        ]
-
-        if candidates:
-            idx = int(self.np_random.integers(0, len(candidates)))
-            self.adversary_pos = candidates[idx]
-            self.grid.set(*self.adversary_pos, self._adversary_obj)
 
         return self._make_obs(obs["image"]), info
 
@@ -281,8 +152,6 @@ class followerEnv(baseFourRoomsEnv):
 
         agent_cell = (int(self.agent_pos[0]), int(self.agent_pos[1]))
         occupied = {agent_cell, self._goal_pos}
-        if self.adversary_pos is not None:
-            occupied.add(self.adversary_pos)
 
         for fixed, is_vert, lo, hi in door_slots:
             if self.np_random.random() >= self.door_shift_prob:
@@ -345,7 +214,7 @@ class followerEnv(baseFourRoomsEnv):
             patch = patch * (1 - _PATH_ALPHA) + _PATH_COLOR_RGB * _PATH_ALPHA
             img[ymin:ymax, xmin:xmax] = patch.astype(np.uint8)
         return img
-    
+
     def gen_obs(self):
         obs = super().gen_obs()
 
@@ -408,9 +277,6 @@ class followerEnv(baseFourRoomsEnv):
             if x < 0 or y < 0 or x >= self.width or y >= self.height:
                 return False
             cell = self.grid.get(x, y)
-            # Treat the adversary's cell as walkable so the plan isn't blocked by it
-            if isinstance(cell, _Adversary):
-                return True
             return cell is None or (x, y) == (gx, gy) or cell.can_overlap()
 
         def heuristic(x, y):

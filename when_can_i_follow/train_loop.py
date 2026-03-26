@@ -10,6 +10,7 @@ from stable_baselines3 import PPO
 
 from envs.lava.env import lavaEnv
 from envs.follower.env import followerEnv
+from envs.standard.env import standardEnv
 from utils.training_utils import SmallCNN, SmallCNNCombinedExtractor
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,8 @@ def make_env(cfg: DictConfig, render_mode: str | None = None) -> gym.Env:
         return lavaEnv(**env_kwargs)
     elif env_name == "follower":
         return followerEnv(**env_kwargs)
+    elif env_name == "standard":
+        return standardEnv(**env_kwargs)
     else:
         raise KeyError(f"Unknown env '{env_name}'.")
 

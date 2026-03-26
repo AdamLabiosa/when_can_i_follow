@@ -6,8 +6,10 @@ import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
 from omegaconf import DictConfig, OmegaConf
 from stable_baselines3 import PPO
+# from sbx import PPO
 
-from envs.gridworld.env import gridworldEnv
+from envs.lava.env import lavaEnv
+from envs.follower.env import followerEnv
 from utils.training_utils import SmallCNN, SmallCNNCombinedExtractor
 
 log = logging.getLogger(__name__)
@@ -20,10 +22,10 @@ def record_videos(model: PPO, cfg: DictConfig) -> None:
     """Roll out the trained model and save N episodes as mp4 files."""
     r = cfg.record
     n = r.n_videos
-    video_dir: str = r.video_dir
-    env_kwargs: dict = OmegaConf.to_container(cfg.env.get("kwargs", {}), resolve=True)
+    env_name: str = cfg.env.name
+    video_dir: str = f"{r.video_dir}/{env_name}"
 
-    env = gridworldEnv(render_mode="rgb_array", **env_kwargs)
+    env = make_env(cfg, render_mode="rgb_array")
     env = RecordVideo(
         env,
         video_folder=video_dir,
@@ -44,14 +46,18 @@ def record_videos(model: PPO, cfg: DictConfig) -> None:
     log.info("Videos saved to %s", video_dir)
 
 
-def make_env(cfg: DictConfig) -> gym.Env:
+def make_env(cfg: DictConfig, render_mode: str | None = None) -> gym.Env:
     """Instantiate the env named in cfg."""
     env_name: str = cfg.env.name
     env_kwargs: dict = OmegaConf.to_container(cfg.env.get("kwargs", {}), resolve=True)
-    if env_name == "gridworld":
-        return gridworldEnv(**env_kwargs)
+    if render_mode is not None:
+        env_kwargs["render_mode"] = render_mode
+    if env_name == "lava":
+        return lavaEnv(**env_kwargs)
+    elif env_name == "follower":
+        return followerEnv(**env_kwargs)
     else:
-        raise KeyError(f"Unknown env '{env_name}'. Available: {list(ENV_REGISTRY.keys())}")
+        raise KeyError(f"Unknown env '{env_name}'.")
 
 
 def select_policy(obs_space: gym.Space) -> tuple[str, dict]:

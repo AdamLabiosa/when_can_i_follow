@@ -1,6 +1,6 @@
-env:
-  name: gridworld
-  kwargs: {}
+defaults:
+  - envs: lava
+  - _self_
 
 train:
   total_timesteps: 500000

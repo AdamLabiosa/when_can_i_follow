@@ -1,0 +1,5 @@
+# @package env
+name: lava
+kwargs:
+  lava_prob: 0.3        # probability per step that lava first appears (spawns every episode, delay is geometric)
+  lava_spread_rate: 0.75 # probability per step that lava grows by one cell

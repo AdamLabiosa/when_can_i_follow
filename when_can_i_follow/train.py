@@ -2,7 +2,7 @@
 
 Run from the repo root:
     python -m when_can_i_follow.train
-    python -m when_can_i_follow.train env.name=gridworld train.total_timesteps=200000
+    python -m when_can_i_follow.train env.name=lava train.total_timesteps=200000
 """
 
 import hydra

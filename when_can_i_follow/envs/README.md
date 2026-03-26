@@ -1,0 +1,1 @@
+This is the environments folder. It contains wrappers or full envs

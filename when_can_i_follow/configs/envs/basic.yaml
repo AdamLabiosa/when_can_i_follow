@@ -1,0 +1,6 @@
+# @package env
+name: basic
+kwargs:
+  plan_delay: 3          # timesteps between requesting and receiving a plan
+  frame_stack: 4         # number of frames to stack (1 = disabled)
+  path_dir_colors: true  # encode direction in path cells (obs channel + render colors)

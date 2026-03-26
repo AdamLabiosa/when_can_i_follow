@@ -1,4 +1,5 @@
 import heapq
+from collections import deque
 
 import gymnasium as gym
 import numpy as np
@@ -19,8 +20,23 @@ _OVERWRITABLE_TYPES = {OBJECT_TO_IDX["empty"], OBJECT_TO_IDX["floor"]}
 _PATH_COLOR_RGB = np.array([30, 144, 255], dtype=np.float32)  # dodger blue
 _PATH_ALPHA = 0.45
 
+# State-channel values that encode movement direction in path cells
+# (1=right, 2=down, 3=left, 4=up; 0 = unknown/fallback)
+_DIR_TO_STATE: dict[tuple[int, int], int] = {
+    (1, 0): 1, (0, 1): 2, (-1, 0): 3, (0, -1): 4,
+}
 
-class standardEnv(baseFourRoomsEnv):
+# Per-direction overlay colors for rendered frames (RGB float32)
+_DIR_COLORS: dict[int, np.ndarray] = {
+    0: np.array([30,  144, 255], dtype=np.float32),  # unknown  → blue
+    1: np.array([30,  144, 255], dtype=np.float32),  # right    → blue
+    2: np.array([50,  220,  80], dtype=np.float32),  # down     → green
+    3: np.array([255, 210,  30], dtype=np.float32),  # left     → yellow
+    4: np.array([255, 100,  30], dtype=np.float32),  # up       → orange
+}
+
+
+class movingOpeningEnv(baseFourRoomsEnv):
     """Four-rooms env with plan-on-demand, without any adversary.
 
     Actions:
@@ -30,7 +46,7 @@ class standardEnv(baseFourRoomsEnv):
         3 — request plan (A* route to goal, delivered after ``plan_delay`` steps)
 
     Observation keys:
-        image          — 7×7×3 egocentric view (plan path shown in blue when ready)
+        image          — 7×7×12 stacked egocentric view (current + 3 prior frames, channel-last)
         plan_computing — 1.0 while a plan is being computed (delay not yet elapsed)
         plan_ready     — 1.0 once a completed plan has been delivered
     """
@@ -39,10 +55,14 @@ class standardEnv(baseFourRoomsEnv):
         self,
         plan_delay: int = 3,
         door_shift_prob: float = 0.0,
+        frame_stack: int = 1,
+        path_dir_colors: bool = True,
         *args,
         **kwargs,
     ):
         self.door_shift_prob = door_shift_prob
+        self._frame_stack = frame_stack
+        self.path_dir_colors = path_dir_colors
 
         # Plan state — initialised properly in reset()
         self._goal_pos: tuple[int, int] = (0, 0)
@@ -59,10 +79,21 @@ class standardEnv(baseFourRoomsEnv):
         # Actions: left / right / forward / request-plan
         self.action_space = gym.spaces.Discrete(4)
 
-        # Dict obs: image + scalar signals exposed as float vectors for SB3
-        _image_space = self.observation_space["image"]
+        # Build frame buffer now that we know the single-frame image shape
+        single_img_shape = self.observation_space["image"].shape  # (H, W, C)
+        self._frame_shape = single_img_shape
+        if self._frame_stack > 1:
+            self._frame_buffer: deque[np.ndarray] | None = deque(
+                [np.zeros(single_img_shape, dtype=np.uint8)] * self._frame_stack,
+                maxlen=self._frame_stack,
+            )
+            image_shape = (*single_img_shape[:2], single_img_shape[2] * self._frame_stack)
+        else:
+            self._frame_buffer = None
+            image_shape = single_img_shape
+
         self.observation_space = gym.spaces.Dict({
-            "image": _image_space,
+            "image": gym.spaces.Box(low=0, high=255, shape=image_shape, dtype=np.uint8),
             "plan_computing": gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
             "plan_ready": gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
         })
@@ -70,8 +101,13 @@ class standardEnv(baseFourRoomsEnv):
         self.max_steps = 200
 
     def _make_obs(self, image: np.ndarray) -> dict:
+        if self._frame_buffer is not None:
+            self._frame_buffer.append(image)
+            obs_image = np.concatenate(list(self._frame_buffer), axis=-1)
+        else:
+            obs_image = image
         return {
-            "image": image,
+            "image": obs_image,
             "plan_computing": np.array(
                 [1.0 if self.plan_started_at is not None else 0.0], dtype=np.float32
             ),
@@ -132,7 +168,15 @@ class standardEnv(baseFourRoomsEnv):
             if (cell := self.grid.get(x, y)) is not None and cell.type == "goal"
         )
 
-        return self._make_obs(obs["image"]), info
+        # Fill the entire buffer with the first real frame
+        first_frame = obs["image"]
+        if self._frame_stack > 1:
+            self._frame_buffer = deque(
+                [first_frame] * self._frame_stack,
+                maxlen=self._frame_stack,
+            )
+
+        return self._make_obs(first_frame), info
 
     def _shift_doors(self) -> None:
         """Per-step door shuffling: each wall segment independently shifts with door_shift_prob."""
@@ -180,38 +224,68 @@ class standardEnv(baseFourRoomsEnv):
     def get_full_render(self, highlight, tile_size):
         img = baseFourRoomsEnv.get_full_render(self, highlight, tile_size)
         if self.plan_path:
-            img = self._overlay_path(img, tile_size, self.plan_path)
+            if self.path_dir_colors:
+                dirs = self._plan_directions()
+                colors: list[np.ndarray] | None = [_DIR_COLORS[d] for d in dirs]
+            else:
+                colors = None
+            img = self._overlay_path(img, tile_size, self.plan_path, colors)
         return img
 
     def get_pov_render(self, tile_size):
         img = baseFourRoomsEnv.get_pov_render(self, tile_size)
         if self.plan_path:
-            view_cells = [
-                (vx, vy)
-                for wx, wy in self.plan_path
-                for vx, vy in [self.get_view_coords(wx, wy)]
-                if 0 <= vx < self.agent_view_size and 0 <= vy < self.agent_view_size
-            ]
-            if view_cells:
-                img = self._overlay_path(img, tile_size, view_cells)
+            dirs = self._plan_directions() if self.path_dir_colors else None
+            visible: list[tuple[int, int]] = []
+            visible_colors: list[np.ndarray] | None = [] if self.path_dir_colors else None
+            for i, (wx, wy) in enumerate(self.plan_path):
+                vx, vy = self.get_view_coords(wx, wy)
+                if 0 <= vx < self.agent_view_size and 0 <= vy < self.agent_view_size:
+                    visible.append((vx, vy))
+                    if visible_colors is not None and dirs is not None:
+                        visible_colors.append(_DIR_COLORS[dirs[i]])
+            if visible:
+                img = self._overlay_path(img, tile_size, visible, visible_colors)
         return img
+
+    def _plan_directions(self) -> list[int]:
+        """Return the state-channel direction value for each cell in plan_path."""
+        path = self.plan_path
+        out: list[int] = []
+        for i, (wx, wy) in enumerate(path):
+            if i + 1 < len(path):
+                nx, ny = path[i + 1]
+                d = _DIR_TO_STATE.get((nx - wx, ny - wy), 0)
+            elif i > 0:
+                px, py = path[i - 1]
+                d = _DIR_TO_STATE.get((wx - px, wy - py), 0)
+            else:
+                d = 0
+            out.append(d)
+        return out
 
     def _overlay_path(
         self,
         img: np.ndarray,
         tile_size: int,
         cells: list[tuple[int, int]],
+        cell_colors: list[np.ndarray] | None = None,
     ) -> np.ndarray:
-        """Return a copy of `img` with a semi-transparent blue overlay on each cell."""
+        """Return a copy of `img` with a semi-transparent overlay on each cell.
+
+        If ``cell_colors`` is provided it must have one RGB array per cell;
+        otherwise the default blue is used for every cell.
+        """
         img = img.copy()
         h, w = img.shape[:2]
-        for cx, cy in cells:
+        for i, (cx, cy) in enumerate(cells):
+            color = cell_colors[i] if cell_colors is not None else _PATH_COLOR_RGB
             ymin, ymax = cy * tile_size, (cy + 1) * tile_size
             xmin, xmax = cx * tile_size, (cx + 1) * tile_size
             if ymin < 0 or xmin < 0 or ymax > h or xmax > w:
                 continue
             patch = img[ymin:ymax, xmin:xmax].astype(np.float32)
-            patch = patch * (1 - _PATH_ALPHA) + _PATH_COLOR_RGB * _PATH_ALPHA
+            patch = patch * (1 - _PATH_ALPHA) + color * _PATH_ALPHA
             img[ymin:ymax, xmin:xmax] = patch.astype(np.uint8)
         return img
 
@@ -220,11 +294,16 @@ class standardEnv(baseFourRoomsEnv):
 
         if self.plan is not None and self.plan_path:
             image = obs["image"].copy()
-            for wx, wy in self.plan_path:
+            dirs = self._plan_directions() if self.path_dir_colors else None
+            for i, (wx, wy) in enumerate(self.plan_path):
                 vx, vy = self.get_view_coords(wx, wy)
                 if 0 <= vx < self.agent_view_size and 0 <= vy < self.agent_view_size:
                     if image[vx, vy, 0] in _OVERWRITABLE_TYPES:
-                        image[vx, vy] = _PATH_CELL
+                        d = dirs[i] if dirs is not None else 0
+                        image[vx, vy] = np.array(
+                            [OBJECT_TO_IDX["floor"], COLOR_TO_IDX["blue"], d],
+                            dtype=np.uint8,
+                        )
             obs["image"] = image
 
         return obs

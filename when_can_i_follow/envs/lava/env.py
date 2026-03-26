@@ -1,4 +1,6 @@
 import heapq
+from collections import deque
+
 import gymnasium as gym
 import numpy as np
 from gymnasium import ObservationWrapper
@@ -19,13 +21,38 @@ _OVERWRITABLE_TYPES = {OBJECT_TO_IDX["empty"], OBJECT_TO_IDX["floor"]}
 _PATH_COLOR_RGB = np.array([30, 144, 255], dtype=np.float32)  # dodger blue
 _PATH_ALPHA = 0.45
 
+# State-channel values that encode movement direction in path cells
+# (1=right, 2=down, 3=left, 4=up; 0 = unknown/fallback)
+_DIR_TO_STATE: dict[tuple[int, int], int] = {
+    (1, 0): 1, (0, 1): 2, (-1, 0): 3, (0, -1): 4,
+}
+
+# Per-direction overlay colors for rendered frames (RGB float32)
+_DIR_COLORS: dict[int, np.ndarray] = {
+    0: np.array([30,  144, 255], dtype=np.float32),  # unknown  → blue
+    1: np.array([30,  144, 255], dtype=np.float32),  # right    → blue
+    2: np.array([50,  220,  80], dtype=np.float32),  # down     → green
+    3: np.array([255, 210,  30], dtype=np.float32),  # left     → yellow
+    4: np.array([255, 100,  30], dtype=np.float32),  # up       → orange
+}
+
 
 # Wrapper for multi room lava env
 class lavaEnv(baseFourRoomsEnv):
-    def __init__(self, lava_prob: float = 0.3, lava_spread_rate: float = 0.75, *args, **kwargs):
+    def __init__(
+        self,
+        lava_prob: float = 0.3,
+        lava_spread_rate: float = 0.75,
+        frame_stack: int = 1,
+        path_dir_colors: bool = True,
+        *args,
+        **kwargs,
+    ):
         # Store before super().__init__ since _gen_grid may run during init
         self.lava_prob = lava_prob
         self.lava_spread_rate = lava_spread_rate
+        self._frame_stack = frame_stack
+        self.path_dir_colors = path_dir_colors
         self.lava_cells: set[tuple[int, int]] = set()
         self._doorways: list[tuple[int, int]] = []
         self._active_doorway: tuple[int, int] | None = None
@@ -40,10 +67,21 @@ class lavaEnv(baseFourRoomsEnv):
         # 0: left, 1: right, 2: forward, 3: create plan
         self.action_space = gym.spaces.Discrete(4)
 
-        # Dict obs: image + two binary flags exposed as float vectors for SB3
-        _image_space = self.observation_space["image"]
+        # Build frame buffer now that we know the single-frame image shape
+        single_img_shape = self.observation_space["image"].shape  # (H, W, C)
+        self._frame_shape = single_img_shape
+        if self._frame_stack > 1:
+            self._frame_buffer: deque[np.ndarray] | None = deque(
+                [np.zeros(single_img_shape, dtype=np.uint8)] * self._frame_stack,
+                maxlen=self._frame_stack,
+            )
+            image_shape = (*single_img_shape[:2], single_img_shape[2] * self._frame_stack)
+        else:
+            self._frame_buffer = None
+            image_shape = single_img_shape
+
         self.observation_space = gym.spaces.Dict({
-            "image": _image_space,
+            "image": gym.spaces.Box(low=0, high=255, shape=image_shape, dtype=np.uint8),
             # 1 while a plan computation is in-flight (requested but delay not elapsed)
             "plan_computing": gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
             # 1 once a completed plan path has been delivered to the agent
@@ -54,15 +92,20 @@ class lavaEnv(baseFourRoomsEnv):
         self.plan_path: list[tuple[int, int]] = []
         self.plan_request_pos: tuple[int, int] | None = None
         self.plan_request_dir: int | None = None
-        self.max_steps = 100
+        self.max_steps = 200
         self.time = 0
 
         self.plan_delay = 3
 
     def _make_obs(self, image: np.ndarray) -> dict:
         """Build the dict observation from a raw image array."""
+        if self._frame_buffer is not None:
+            self._frame_buffer.append(image)
+            obs_image = np.concatenate(list(self._frame_buffer), axis=-1)
+        else:
+            obs_image = image
         return {
-            "image": image,
+            "image": obs_image,
             "plan_computing": np.array(
                 [1.0 if self.plan_started_at is not None else 0.0], dtype=np.float32
             ),
@@ -267,7 +310,15 @@ class lavaEnv(baseFourRoomsEnv):
             self._pending_lava_doorway = self._doorways[idx]
         self._safe_path = self._generate_safe_path()
 
-        return self._make_obs(obs['image']), info
+        # Fill the entire buffer with the first real frame
+        first_frame = obs['image']
+        if self._frame_stack > 1:
+            self._frame_buffer = deque(
+                [first_frame] * self._frame_stack,
+                maxlen=self._frame_stack,
+            )
+
+        return self._make_obs(first_frame), info
 
     def render(self):
         return super().render()
@@ -275,41 +326,68 @@ class lavaEnv(baseFourRoomsEnv):
     def get_full_render(self, highlight, tile_size):
         img = baseFourRoomsEnv.get_full_render(self, highlight, tile_size)
         if self.plan_path:
-            img = self._overlay_path(img, tile_size, self.plan_path)
+            if self.path_dir_colors:
+                dirs = self._plan_directions()
+                colors: list[np.ndarray] | None = [_DIR_COLORS[d] for d in dirs]
+            else:
+                colors = None
+            img = self._overlay_path(img, tile_size, self.plan_path, colors)
         return img
 
     def get_pov_render(self, tile_size):
         img = baseFourRoomsEnv.get_pov_render(self, tile_size)
         if self.plan_path:
-            view_cells = [
-                (vx, vy)
-                for wx, wy in self.plan_path
-                for vx, vy in [self.get_view_coords(wx, wy)]
-                if 0 <= vx < self.agent_view_size and 0 <= vy < self.agent_view_size
-            ]
-            if view_cells:
-                img = self._overlay_path(img, tile_size, view_cells)
+            dirs = self._plan_directions() if self.path_dir_colors else None
+            visible: list[tuple[int, int]] = []
+            visible_colors: list[np.ndarray] | None = [] if self.path_dir_colors else None
+            for i, (wx, wy) in enumerate(self.plan_path):
+                vx, vy = self.get_view_coords(wx, wy)
+                if 0 <= vx < self.agent_view_size and 0 <= vy < self.agent_view_size:
+                    visible.append((vx, vy))
+                    if visible_colors is not None and dirs is not None:
+                        visible_colors.append(_DIR_COLORS[dirs[i]])
+            if visible:
+                img = self._overlay_path(img, tile_size, visible, visible_colors)
         return img
+
+    def _plan_directions(self) -> list[int]:
+        """Return the state-channel direction value for each cell in plan_path."""
+        path = self.plan_path
+        out: list[int] = []
+        for i, (wx, wy) in enumerate(path):
+            if i + 1 < len(path):
+                nx, ny = path[i + 1]
+                d = _DIR_TO_STATE.get((nx - wx, ny - wy), 0)
+            elif i > 0:
+                px, py = path[i - 1]
+                d = _DIR_TO_STATE.get((wx - px, wy - py), 0)
+            else:
+                d = 0
+            out.append(d)
+        return out
 
     def _overlay_path(
         self,
         img: np.ndarray,
         tile_size: int,
         cells: list[tuple[int, int]],
+        cell_colors: list[np.ndarray] | None = None,
     ) -> np.ndarray:
-        """Return a copy of `img` with a semi-transparent blue overlay on each cell.
+        """Return a copy of `img` with a semi-transparent overlay on each cell.
 
-        `cells` are (col, row) grid indices where col maps to the x-axis and
-        row maps to the y-axis of the rendered image (img[row*ts, col*ts])."""
+        ``cells`` are (col, row) grid indices. If ``cell_colors`` is provided it
+        must have one RGB array per cell; otherwise the default blue is used.
+        """
         img = img.copy()
         h, w = img.shape[:2]
-        for cx, cy in cells:
+        for i, (cx, cy) in enumerate(cells):
+            color = cell_colors[i] if cell_colors is not None else _PATH_COLOR_RGB
             ymin, ymax = cy * tile_size, (cy + 1) * tile_size
             xmin, xmax = cx * tile_size, (cx + 1) * tile_size
             if ymin < 0 or xmin < 0 or ymax > h or xmax > w:
                 continue
             patch = img[ymin:ymax, xmin:xmax].astype(np.float32)
-            patch = patch * (1 - _PATH_ALPHA) + _PATH_COLOR_RGB * _PATH_ALPHA
+            patch = patch * (1 - _PATH_ALPHA) + color * _PATH_ALPHA
             img[ymin:ymax, xmin:xmax] = patch.astype(np.uint8)
         return img
 
@@ -321,11 +399,16 @@ class lavaEnv(baseFourRoomsEnv):
 
             if self.plan_path:
                 image = obs['image'].copy()
-                for wx, wy in self.plan_path:
+                dirs = self._plan_directions() if self.path_dir_colors else None
+                for i, (wx, wy) in enumerate(self.plan_path):
                     vx, vy = self.get_view_coords(wx, wy)
                     if 0 <= vx < self.agent_view_size and 0 <= vy < self.agent_view_size:
                         if image[vx, vy, 0] in _OVERWRITABLE_TYPES:
-                            image[vx, vy] = _PATH_CELL
+                            d = dirs[i] if dirs is not None else 0
+                            image[vx, vy] = np.array(
+                                [OBJECT_TO_IDX["floor"], COLOR_TO_IDX["blue"], d],
+                                dtype=np.uint8,
+                            )
                 obs['image'] = image
 
         return obs

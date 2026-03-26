@@ -8,9 +8,10 @@ from omegaconf import DictConfig, OmegaConf
 from stable_baselines3 import PPO
 # from sbx import PPO
 
+from envs.basic.env import basicEnv
 from envs.lava.env import lavaEnv
 from envs.follower.env import followerEnv
-from envs.standard.env import standardEnv
+from envs.moving_openings.env import movingOpeningEnv
 from utils.training_utils import SmallCNN, SmallCNNCombinedExtractor
 
 log = logging.getLogger(__name__)
@@ -53,12 +54,14 @@ def make_env(cfg: DictConfig, render_mode: str | None = None) -> gym.Env:
     env_kwargs: dict = OmegaConf.to_container(cfg.env.get("kwargs", {}), resolve=True)
     if render_mode is not None:
         env_kwargs["render_mode"] = render_mode
-    if env_name == "lava":
+    if env_name == "basic":
+        return basicEnv(**env_kwargs)
+    elif env_name == "lava":
         return lavaEnv(**env_kwargs)
     elif env_name == "follower":
         return followerEnv(**env_kwargs)
-    elif env_name == "standard":
-        return standardEnv(**env_kwargs)
+    elif env_name == "moving_opening":
+        return movingOpeningEnv(**env_kwargs)
     else:
         raise KeyError(f"Unknown env '{env_name}'.")
 

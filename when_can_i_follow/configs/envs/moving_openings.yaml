@@ -1,5 +1,7 @@
 # @package env
-name: standard
+name: moving_opening
 kwargs:
   plan_delay: 3          # timesteps between requesting and receiving a plan
   door_shift_prob: 0.1   # per-door probability of moving to a random position on that wall
+  frame_stack: 4         # number of frames to stack (1 = disabled)
+  path_dir_colors: true  # encode direction in path cells (obs channel + render colors)

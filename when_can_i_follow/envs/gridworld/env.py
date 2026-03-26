@@ -24,36 +24,75 @@ class gridworldEnv(baseFourRoomsEnv):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Add in new actions
+        # Add in new action
         # 0: left, 1: right, 2: forward, 3: create plan
         self.action_space = gym.spaces.Discrete(4)
 
-        # step() and reset() return only the image — align the declared space accordingly
-        self.observation_space = self.observation_space["image"]
+        # Dict obs: image + two binary flags exposed as float vectors for SB3
+        _image_space = self.observation_space["image"]
+        self.observation_space = gym.spaces.Dict({
+            "image": _image_space,
+            # 1 while a plan computation is in-flight (requested but delay not elapsed)
+            "plan_computing": gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
+            # 1 once a completed plan path has been delivered to the agent
+            "plan_ready": gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
+        })
 
         self.plan: list[int] | None = None
         self.plan_path: list[tuple[int, int]] = []
+        self.plan_request_pos: tuple[int, int] | None = None
+        self.plan_request_dir: int | None = None
         self.max_steps = 100
+        self.time = 0
+        
+        self.plan_delay = 3
+        
+
+    def _make_obs(self, image: np.ndarray) -> dict:
+        """Build the dict observation from a raw image array."""
+        return {
+            "image": image,
+            "plan_computing": np.array(
+                [1.0 if self.plan_started_at is not None else 0.0], dtype=np.float32
+            ),
+            "plan_ready": np.array(
+                [1.0 if self.plan_path else 0.0], dtype=np.float32
+            ),
+        }
 
     def step(self, action):
         self.time += 1
+        
+        if self.plan_started_at is not None and self.time - self.plan_started_at >= self.plan_delay:
+            # Give plan to agent (note it is a slightly old plan due to real-time delay)
+            if self.plan is not None:
+                self.plan_path = self._actions_to_world_coords(
+                    self.plan_request_pos, self.plan_request_dir, self.plan
+                )
+            else:
+                self.plan_path = []
+            self.plan_started_at = None
 
         if action == 3:
+            # Create plan
+            self.plan_started_at = self.time
+            self.plan_request_pos = tuple(self.agent_pos)
+            self.plan_request_dir = self.agent_dir
             self.plan = self.get_plan()
-            image_obs = self.gen_obs()['image']
             
+            image_obs = self.gen_obs()['image']
             reward = 0
             term = False
             trunc = self.time >= self.max_steps
             
-            return image_obs, reward, term, trunc, {}
+            return self._make_obs(image_obs), reward, term, trunc, {}
         else:
             obs, reward, terminated, truncated, info = super().step(action)
-            image_obs = obs['image']
-            return image_obs, reward, terminated, truncated, info
+            return self._make_obs(obs['image']), reward, terminated, truncated, info
 
     def reset(self, *args, **kwargs):
         self.time = 0
+        self.plan_started_at = None
 
         obs, info = super().reset(*args, **kwargs)
         self._goal_pos = next(
@@ -64,9 +103,10 @@ class gridworldEnv(baseFourRoomsEnv):
         )
         self.plan = None
         self.plan_path = []
+        self.plan_request_pos = None
+        self.plan_request_dir = None
         
-        image_obs = obs['image']
-        return image_obs, info
+        return self._make_obs(obs['image']), info
 
     def render(self):
         return super().render()

@@ -8,7 +8,7 @@ from omegaconf import DictConfig, OmegaConf
 from stable_baselines3 import PPO
 
 from envs.gridworld.env import gridworldEnv
-from utils.training_utils import SmallCNN
+from utils.training_utils import SmallCNN, SmallCNNCombinedExtractor
 
 log = logging.getLogger(__name__)
 
@@ -57,12 +57,22 @@ def make_env(cfg: DictConfig) -> gym.Env:
 def select_policy(obs_space: gym.Space) -> tuple[str, dict]:
     """Return (policy_str, policy_kwargs) for the given observation space.
 
-    - Dict obs                        → MultiInputPolicy
+    - Dict obs with small image       → MultiInputPolicy + SmallCNNCombinedExtractor
+    - Dict obs with large image       → MultiInputPolicy (default NatureCNN)
     - 3-D Box, spatial dims ≥ 36     → CnnPolicy with default NatureCNN
     - 3-D Box, spatial dims < 36     → CnnPolicy with SmallCNN extractor
     - Everything else                 → MlpPolicy
     """
     if isinstance(obs_space, gym.spaces.Dict):
+        # Check if any image subspace is too small for NatureCNN
+        needs_small_cnn = any(
+            isinstance(subspace, gym.spaces.Box)
+            and len(subspace.shape) == 3
+            and (subspace.shape[0] < _NATURE_CNN_MIN_SIZE or subspace.shape[1] < _NATURE_CNN_MIN_SIZE)
+            for subspace in obs_space.spaces.values()
+        )
+        if needs_small_cnn:
+            return "MultiInputPolicy", {"features_extractor_class": SmallCNNCombinedExtractor}
         return "MultiInputPolicy", {}
     if isinstance(obs_space, gym.spaces.Box) and len(obs_space.shape) >= 3:
         h, w = obs_space.shape[:2]
@@ -93,6 +103,7 @@ def train(cfg: DictConfig) -> PPO:
         clip_range=t.clip_range,
         ent_coef=t.ent_coef,
         verbose=1,
+        device="cpu",
     )
 
     model.learn(

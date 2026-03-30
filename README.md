@@ -14,3 +14,9 @@ We want to create agents with a few properties:
 ## Current status
 The "easy" version works quite well. However, as the tasks get more stochastic and complex, the policy struggles to learn from scratch. 
 Ideas: Curriculum learning/fine tuning
+
+Possibly domain: [https://github.com/waymo-research/waymax]
+
+## Useful commands
+
+`python when_can_i_follow/train.py envs=basic`

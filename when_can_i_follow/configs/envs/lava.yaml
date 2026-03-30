@@ -3,5 +3,6 @@ name: lava
 kwargs:
   lava_prob: 0.3         # probability per step that lava first appears (spawns every episode, delay is geometric)
   lava_spread_rate: 0.75 # probability per step that lava grows by one cell
-  frame_stack: 4         # number of frames to stack (1 = disabled)
+  frame_stack: 1         # number of frames to stack (1 = disabled)
   path_dir_colors: true  # encode direction in path cells (obs channel + render colors)
+  lava_buffer: 5         # minimum Manhattan distance the plan tries to keep from lava (0 = disabled)

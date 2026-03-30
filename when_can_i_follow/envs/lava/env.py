@@ -45,6 +45,7 @@ class lavaEnv(baseFourRoomsEnv):
         lava_spread_rate: float = 0.75,
         frame_stack: int = 1,
         path_dir_colors: bool = True,
+        lava_buffer: int = 1,
         *args,
         **kwargs,
     ):
@@ -53,6 +54,7 @@ class lavaEnv(baseFourRoomsEnv):
         self.lava_spread_rate = lava_spread_rate
         self._frame_stack = frame_stack
         self.path_dir_colors = path_dir_colors
+        self.lava_buffer = lava_buffer
         self.lava_cells: set[tuple[int, int]] = set()
         self._doorways: list[tuple[int, int]] = []
         self._active_doorway: tuple[int, int] | None = None
@@ -280,6 +282,7 @@ class lavaEnv(baseFourRoomsEnv):
             return self._make_obs(image_obs), reward, term, trunc, {}
         else:
             obs, reward, terminated, truncated, info = super().step(action)
+            reward = 1.0 if terminated and reward > 0 else 0.0
             return self._make_obs(obs['image']), reward, terminated, truncated, info
 
     def reset(self, *args, **kwargs):
@@ -439,25 +442,32 @@ class lavaEnv(baseFourRoomsEnv):
                 coords.append((x, y))
         return coords
 
-    def get_plan(self, pos=None, agent_dir=None, output='actions'):
+    def _lava_buffer_cells(self, n: int) -> set[tuple[int, int]]:
+        """Return all grid cells within Manhattan distance n of any lava cell."""
+        if n <= 0 or not self.lava_cells:
+            return set()
+        buffer: set[tuple[int, int]] = set()
+        for lx, ly in self.lava_cells:
+            for dx in range(-n, n + 1):
+                rem = n - abs(dx)
+                for dy in range(-rem, rem + 1):
+                    nx, ny = lx + dx, ly + dy
+                    if 0 <= nx < self.width and 0 <= ny < self.height:
+                        buffer.add((nx, ny))
+        return buffer
+
+    def _astar(
+        self,
+        pos: tuple,
+        agent_dir: int,
+        output: str,
+        extra_blocked: set[tuple[int, int]],
+    ):
+        """Core A* over (x, y, dir) state space.
+
+        extra_blocked: cells treated as unwalkable in addition to actual lava.
+        Returns the plan in the requested output format, or None if unreachable.
         """
-        A* planner from pos to goal over the (x, y, direction) state space.
-
-        Args:
-            pos:       (x, y) start position.
-            agent_dir: starting direction (0=right,1=down,2=left,3=up).
-                       Defaults to self.agent_dir.
-            output:    'actions'    → list of action ints (0=left,1=right,2=forward)
-                       'directions' → list of (dx, dy) move vectors (turns omitted)
-
-        Returns:
-            Optimal sequence as specified by `output`, or None if unreachable.
-        """
-        if pos is None:
-            pos = self.agent_pos
-        if agent_dir is None:
-            agent_dir = self.agent_dir
-
         gx, gy = self._goal_pos
 
         def is_walkable(x, y):
@@ -465,17 +475,18 @@ class lavaEnv(baseFourRoomsEnv):
                 return False
             if (x, y) in self.lava_cells:
                 return False
+            if (x, y) in extra_blocked:
+                return False
             cell = self.grid.get(x, y)
             return cell is None or (x, y) == (gx, gy) or cell.can_overlap()
 
         def heuristic(x, y):
             return abs(x - gx) + abs(y - gy)
 
-        # state: (x, y, dir); heap: (f, counter, g, state, actions_so_far)
         start = (pos[0], pos[1], agent_dir)
         counter = 0
         heap = [(heuristic(pos[0], pos[1]), counter, 0, start, [])]
-        visited = {}
+        visited: dict = {}
 
         while heap:
             f, _, g, state, actions = heapq.heappop(heap)
@@ -484,7 +495,6 @@ class lavaEnv(baseFourRoomsEnv):
             if (x, y) == (gx, gy):
                 if output == 'actions':
                     return actions
-                # Replay actions to extract movement directions only
                 directions = []
                 cur_d = agent_dir
                 for a in actions:
@@ -492,7 +502,7 @@ class lavaEnv(baseFourRoomsEnv):
                         cur_d = (cur_d - 1) % 4
                     elif a == 1:
                         cur_d = (cur_d + 1) % 4
-                    else:  # forward
+                    else:
                         directions.append(_DIR_VECS[cur_d])
                 return directions
 
@@ -525,4 +535,37 @@ class lavaEnv(baseFourRoomsEnv):
                     counter += 1
                     heapq.heappush(heap, (ng + heuristic(nx, ny), counter, ng, ns, actions + [2]))
 
-        return None  # unreachable
+        return None
+
+    def get_plan(self, pos=None, agent_dir=None, output='actions'):
+        """
+        A* planner from pos to goal over the (x, y, direction) state space.
+
+        Prefers paths that stay at least `lava_buffer` Manhattan distance from
+        any lava cell.  If no such path exists, falls back to any path that
+        merely avoids actual lava cells.
+
+        Args:
+            pos:       (x, y) start position.
+            agent_dir: starting direction (0=right,1=down,2=left,3=up).
+                       Defaults to self.agent_dir.
+            output:    'actions'    → list of action ints (0=left,1=right,2=forward)
+                       'directions' → list of (dx, dy) move vectors (turns omitted)
+
+        Returns:
+            Optimal sequence as specified by `output`, or None if unreachable.
+        """
+        if pos is None:
+            pos = self.agent_pos
+        if agent_dir is None:
+            agent_dir = self.agent_dir
+
+        # First pass: try to stay lava_buffer cells away from any lava
+        if self.lava_buffer > 0 and self.lava_cells:
+            buffer_cells = self._lava_buffer_cells(self.lava_buffer)
+            result = self._astar(pos, agent_dir, output, extra_blocked=buffer_cells)
+            if result is not None:
+                return result
+
+        # Fallback: just avoid actual lava cells
+        return self._astar(pos, agent_dir, output, extra_blocked=set())

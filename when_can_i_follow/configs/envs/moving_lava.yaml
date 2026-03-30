@@ -1,0 +1,14 @@
+# @package env
+name: moving_lava
+kwargs:
+  grid_size: 15          # full grid side length including outer walls (interior is 13x13)
+  min_lava_len: 2        # minimum vertical cell-count of a lava strip  (A)
+  max_lava_len: 5        # maximum vertical cell-count of a lava strip  (B)
+  min_x_gap: 2           # minimum column gap between consecutive strips (C)
+  max_x_gap: 4           # maximum column gap between consecutive strips (D)
+  min_y_gap: 1           # minimum vertical variation between strip starts (E)
+  max_y_gap: 3           # maximum vertical variation between strip starts (F)
+  lava_buffer: 1         # Manhattan-distance buffer the planner keeps from lava
+  plan_delay: 3          # steps between plan request and delivery
+  frame_stack: 1         # number of frames to stack (1 = disabled)
+  path_dir_colors: true  # encode direction in path cells (obs channel + render colors)

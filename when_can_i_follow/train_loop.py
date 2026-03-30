@@ -11,8 +11,9 @@ from stable_baselines3 import PPO
 from envs.basic.env import basicEnv
 from envs.lava.env import lavaEnv
 from envs.follower.env import followerEnv
+from envs.moving_lava.env import movingLavaEnv
 from envs.moving_openings.env import movingOpeningEnv
-from utils.training_utils import SmallCNN, SmallCNNCombinedExtractor
+from utils.training_utils import SmallCNN, SmallCNNCombinedExtractor, ActionTextOverlayWrapper
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ def record_videos(model: PPO, cfg: DictConfig) -> None:
     video_dir: str = f"{r.video_dir}/{env_name}"
 
     env = make_env(cfg, render_mode="rgb_array")
+    env = ActionTextOverlayWrapper(env)
     env = RecordVideo(
         env,
         video_folder=video_dir,
@@ -60,6 +62,8 @@ def make_env(cfg: DictConfig, render_mode: str | None = None) -> gym.Env:
         return lavaEnv(**env_kwargs)
     elif env_name == "follower":
         return followerEnv(**env_kwargs)
+    elif env_name == "moving_lava":
+        return movingLavaEnv(**env_kwargs)
     elif env_name == "moving_opening":
         return movingOpeningEnv(**env_kwargs)
     else:
@@ -102,21 +106,33 @@ def train(cfg: DictConfig) -> PPO:
     log.info("Selected policy: %s", policy)
 
     t = cfg.train
-    model = PPO(
-        policy=policy,
-        env=env,
-        policy_kwargs=policy_kwargs,
-        n_steps=t.n_steps,
-        batch_size=t.batch_size,
-        n_epochs=t.n_epochs,
-        learning_rate=t.learning_rate,
-        gamma=t.gamma,
-        gae_lambda=t.gae_lambda,
-        clip_range=t.clip_range,
-        ent_coef=t.ent_coef,
-        verbose=1,
-        device="cpu",
-    )
+    load_path = t.get("load_path")
+    if load_path:
+        finetune_lr = t.get("finetune_lr")
+        lr = finetune_lr if finetune_lr is not None else t.learning_rate
+        log.info("Loading model from %s  |  learning_rate: %s", load_path, lr)
+        model = PPO.load(
+            load_path,
+            env=env,
+            device="cpu",
+            custom_objects={"learning_rate": lr},
+        )
+    else:
+        model = PPO(
+            policy=policy,
+            env=env,
+            policy_kwargs=policy_kwargs,
+            n_steps=t.n_steps,
+            batch_size=t.batch_size,
+            n_epochs=t.n_epochs,
+            learning_rate=t.learning_rate,
+            gamma=t.gamma,
+            gae_lambda=t.gae_lambda,
+            clip_range=t.clip_range,
+            ent_coef=t.ent_coef,
+            verbose=1,
+            device="cpu",
+        )
 
     model.learn(
         total_timesteps=t.total_timesteps,

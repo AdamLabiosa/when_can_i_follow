@@ -46,6 +46,7 @@ class lavaEnv(baseFourRoomsEnv):
         frame_stack: int = 1,
         path_dir_colors: bool = True,
         lava_buffer: int = 1,
+        max_steps: int = 200,
         *args,
         **kwargs,
     ):
@@ -94,7 +95,7 @@ class lavaEnv(baseFourRoomsEnv):
         self.plan_path: list[tuple[int, int]] = []
         self.plan_request_pos: tuple[int, int] | None = None
         self.plan_request_dir: int | None = None
-        self.max_steps = 200
+        self.max_steps = max_steps
         self.time = 0
 
         self.plan_delay = 3

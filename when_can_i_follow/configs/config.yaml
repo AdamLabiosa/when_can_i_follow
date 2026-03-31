@@ -8,11 +8,11 @@ train:
   batch_size: 64
   n_epochs: 10
   learning_rate: 3.0e-4
-  finetune_lr: 3.0e-5        # if set, overrides learning_rate when loading a model
+  finetune_lr: 1.0e-4        # if set, overrides learning_rate when loading a model
   gamma: 0.99
   gae_lambda: 0.95
   clip_range: 0.2
-  ent_coef: 0.001
+  ent_coef: 0.00
   log_interval: 10
   load_path: null
   save_path: null

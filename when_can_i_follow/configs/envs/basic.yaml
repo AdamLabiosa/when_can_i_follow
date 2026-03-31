@@ -4,3 +4,4 @@ kwargs:
   plan_delay: 3          # timesteps between requesting and receiving a plan
   frame_stack: 1         # number of frames to stack (1 = disabled)
   path_dir_colors: true  # encode direction in path cells (obs channel + render colors)
+  max_steps: 100         # maximum steps per episode before truncation

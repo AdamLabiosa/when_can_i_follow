@@ -57,6 +57,7 @@ class movingOpeningEnv(baseFourRoomsEnv):
         door_shift_prob: float = 0.0,
         frame_stack: int = 1,
         path_dir_colors: bool = True,
+        max_steps: int = 200,
         *args,
         **kwargs,
     ):
@@ -98,7 +99,7 @@ class movingOpeningEnv(baseFourRoomsEnv):
             "plan_ready": gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
         })
 
-        self.max_steps = 200
+        self.max_steps = max_steps
 
     def _make_obs(self, image: np.ndarray) -> dict:
         if self._frame_buffer is not None:

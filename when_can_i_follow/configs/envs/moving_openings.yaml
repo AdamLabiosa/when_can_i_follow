@@ -5,3 +5,4 @@ kwargs:
   door_shift_prob: 0.1   # per-door probability of moving to a random position on that wall
   frame_stack: 1         # number of frames to stack (1 = disabled)
   path_dir_colors: true  # encode direction in path cells (obs channel + render colors)
+  max_steps: 100         # maximum steps per episode before truncation

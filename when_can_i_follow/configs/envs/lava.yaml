@@ -6,3 +6,4 @@ kwargs:
   frame_stack: 1         # number of frames to stack (1 = disabled)
   path_dir_colors: true  # encode direction in path cells (obs channel + render colors)
   lava_buffer: 5         # minimum Manhattan distance the plan tries to keep from lava (0 = disabled)
+  max_steps: 100         # maximum steps per episode before truncation

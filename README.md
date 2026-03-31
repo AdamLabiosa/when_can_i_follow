@@ -12,10 +12,22 @@ We want to create agents with a few properties:
     - When to recreate one?
 
 ## Current status
+
+Curriculum learning seems to work well. However, we are in a situation in which the agent gets scared to approach near lava. The high level idea is we want to be able to truly trust plans when they are good, and not trust when they are bad. Ideas:
+- We give a small reward for path following
+- We add in part of the loss which disourages not staying close to plan following policy for fine tuning
+
+Other ideas:
+- Small penalty for calling plan? Avoids getting stuck calling plans
+ 
+
 The "easy" version works quite well. However, as the tasks get more stochastic and complex, the policy struggles to learn from scratch. 
 Ideas: Curriculum learning/fine tuning
 
-Possibly domain: [https://github.com/waymo-research/waymax]
+
+
+
+Possibly a good domain: [https://github.com/waymo-research/waymax]
 
 ## Useful commands
 

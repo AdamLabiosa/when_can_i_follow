@@ -8,7 +8,9 @@ kwargs:
   max_x_gap: 4           # maximum column gap between consecutive strips (D)
   min_y_gap: 1           # minimum vertical variation between strip starts (E)
   max_y_gap: 3           # maximum vertical variation between strip starts (F)
-  lava_buffer: 1         # Manhattan-distance buffer the planner keeps from lava
+  lava_buffer: 1         # Manhattan-distance buffer the planner keeps from lava (ignored when planner_ignores_lava is true)
+  planner_ignores_lava: false  # if true, planner treats lava as passable and plans the shortest path regardless
   plan_delay: 3          # steps between plan request and delivery
   frame_stack: 1         # number of frames to stack (1 = disabled)
   path_dir_colors: true  # encode direction in path cells (obs channel + render colors)
+  max_steps: 100         # maximum steps per episode before truncation

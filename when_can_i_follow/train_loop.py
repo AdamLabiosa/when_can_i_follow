@@ -9,8 +9,9 @@ from stable_baselines3 import PPO
 # from sbx import PPO
 
 from envs.basic.env import basicEnv
-from envs.lava.env import lavaEnv
+from envs.city_block.env import cityBlockEnv
 from envs.follower.env import followerEnv
+from envs.lava.env import lavaEnv
 from envs.moving_lava.env import movingLavaEnv
 from envs.moving_openings.env import movingOpeningEnv
 from utils.training_utils import SmallCNN, SmallCNNCombinedExtractor, ActionTextOverlayWrapper
@@ -58,6 +59,8 @@ def make_env(cfg: DictConfig, render_mode: str | None = None) -> gym.Env:
         env_kwargs["render_mode"] = render_mode
     if env_name == "basic":
         return basicEnv(**env_kwargs)
+    elif env_name == "city_block":
+        return cityBlockEnv(**env_kwargs)
     elif env_name == "lava":
         return lavaEnv(**env_kwargs)
     elif env_name == "follower":

@@ -1,0 +1,11 @@
+# @package env
+name: city_block
+kwargs:
+  grid_size: 19          # full grid side length including outer walls (interior is 17x17)
+  block_size: 3          # side length of each city block in cells; streets are always 1 cell wide
+  lava_density: 0.25     # probability that each non-protected street-segment cell gets a lava tile
+  plan_delay: 3          # steps between plan request and delivery
+  frame_stack: 1         # number of frames to stack (1 = disabled)
+  path_dir_colors: true  # encode movement direction in path overlay colors
+  min_goal_dist: 3       # minimum intersection-graph hops between start and goal
+  max_steps: 100         # maximum steps per episode before truncation

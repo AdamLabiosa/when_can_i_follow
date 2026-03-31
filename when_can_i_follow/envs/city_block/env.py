@@ -6,7 +6,7 @@ import numpy as np
 from minigrid.core.constants import OBJECT_TO_IDX, COLOR_TO_IDX
 from minigrid.core.grid import Grid
 from minigrid.core.mission import MissionSpace
-from minigrid.core.world_object import Goal, Lava
+from minigrid.core.world_object import Goal, Lava, Wall
 from minigrid.minigrid_env import MiniGridEnv
 
 # Direction vectors indexed by MiniGrid dir encoding: right, down, left, up
@@ -20,7 +20,6 @@ _PATH_COLOR_RGB = np.array([30, 144, 255], dtype=np.float32)  # dodger blue
 _PATH_ALPHA = 0.45
 
 # State-channel values that encode movement direction in path cells
-# (1=right, 2=down, 3=left, 4=up; 0 = unknown/fallback)
 _DIR_TO_STATE: dict[tuple[int, int], int] = {
     (1, 0): 1, (0, 1): 2, (-1, 0): 3, (0, -1): 4,
 }
@@ -35,71 +34,63 @@ _DIR_COLORS: dict[int, np.ndarray] = {
 }
 
 
-class movingLavaEnv(MiniGridEnv):
-    """NxN empty grid with vertically-sliding lava lines.
+class cityBlockEnv(MiniGridEnv):
+    """NxN grid laid out as city blocks separated by 1-cell-wide streets.
 
-    The agent starts in the middle of the left side facing right and must reach
-    a randomly chosen cell on the right side.  Vertical strips of lava are
-    scattered across the grid; each strip slides up or down by one cell every
-    step and bounces off the top/bottom walls.
+    The world is divided into solid city blocks (walls) and streets (walkable
+    1-cell-wide corridors). Lava is scattered on street segments between
+    intersections. The agent must navigate from a random intersection to a
+    goal intersection.
+
+    The key mechanic: the planner (A*) only knows about lava cells the agent
+    has already observed. Unseen lava is treated as passable, so the planner
+    may route the agent through hidden danger zones. At least one lava-free
+    path from start to goal is always guaranteed by construction.
 
     Actions: 0=turn left, 1=turn right, 2=move forward, 3=request plan.
 
     Parameters
     ----------
-    grid_size      : Full grid side length, including outer walls (so the
-                     playable interior is (grid_size-2) x (grid_size-2)).
-    min_lava_len   : Minimum vertical cell-count of a lava strip   (A).
-    max_lava_len   : Maximum vertical cell-count of a lava strip   (B).
-    min_x_gap      : Minimum column gap between consecutive strips  (C).
-    max_x_gap      : Maximum column gap between consecutive strips  (D).
-    min_y_gap      : Minimum vertical variation between strip starts (E).
-    max_y_gap      : Maximum vertical variation between strip starts (F).
-    lava_buffer         : Manhattan-distance buffer the planner keeps from lava
-                          (ignored when planner_ignores_lava is True).
-    planner_ignores_lava: If True, the planner treats lava as passable and
-                          plans the shortest path regardless of lava positions.
-    plan_delay     : Steps between a plan request and its delivery.
-    frame_stack    : Number of consecutive frames to stack (1 = disabled).
-    path_dir_colors: Encode movement direction via color in the path overlay.
+    grid_size    : Full grid side length including outer walls.
+    block_size   : Side length of each city block in cells.  Streets are
+                   always 1 cell wide and fall every (block_size + 1) cells.
+    lava_density : Probability that each non-protected street-segment cell
+                   gets a lava tile.
+    plan_delay   : Steps between a plan request and its delivery.
+    frame_stack  : Number of consecutive frames to stack (1 = disabled).
+    path_dir_colors : Encode movement direction in path overlay colors.
+    min_goal_dist   : Minimum intersection-graph distance between start and
+                      goal (in intersection hops).
     """
 
     def __init__(
         self,
-        grid_size: int = 15,
-        min_lava_len: int = 2,
-        max_lava_len: int = 5,
-        min_x_gap: int = 2,
-        max_x_gap: int = 4,
-        min_y_gap: int = 1,
-        max_y_gap: int = 3,
-        lava_buffer: int = 1,
-        planner_ignores_lava: bool = False,
+        grid_size: int = 19,
+        block_size: int = 3,
+        lava_density: float = 0.25,
         plan_delay: int = 3,
         frame_stack: int = 1,
         path_dir_colors: bool = True,
-        max_steps: int = 900,
+        min_goal_dist: int = 3,
+        max_steps: int = 500,
         **kwargs,
     ):
         self.grid_size = grid_size
-        self.min_lava_len = min_lava_len
-        self.max_lava_len = max_lava_len
-        self.min_x_gap = min_x_gap
-        self.max_x_gap = max_x_gap
-        self.min_y_gap = min_y_gap
-        self.max_y_gap = max_y_gap
-        self.lava_buffer = lava_buffer
-        self.planner_ignores_lava = planner_ignores_lava
+        self.block_size = block_size
+        self.lava_density = lava_density
         self.plan_delay = plan_delay
         self._frame_stack = frame_stack
         self.path_dir_colors = path_dir_colors
+        self.min_goal_dist = min_goal_dist
 
-        # Runtime state — initialised before super().__init__ so _gen_grid runs safely
-        self._lava_lines: list[list] = []   # each entry: [x, y_top, length, direction]
+        # Runtime state — set before super().__init__ so _gen_grid runs safely
         self.lava_cells: set[tuple[int, int]] = set()
-        self._goal_pos: tuple[int, int] = (grid_size - 2, grid_size // 2)
+        self.seen_lava: set[tuple[int, int]] = set()
+        self._goal_pos: tuple[int, int] = (grid_size // 2, grid_size // 2)
         self.plan_started_at: int | None = None
         self.time = 0
+        self._street_cols: list[int] = []
+        self._street_rows: list[int] = []
 
         mission_space = MissionSpace(mission_func=lambda: "reach the green goal")
         super().__init__(
@@ -110,11 +101,9 @@ class movingLavaEnv(MiniGridEnv):
             **kwargs,
         )
 
-        # Override to 4 discrete actions (0=left, 1=right, 2=forward, 3=plan)
         self.action_space = gym.spaces.Discrete(4)
 
-        # Build observation space, optionally stacking frames
-        single_img_shape = self.observation_space["image"].shape  # (H, W, C)
+        single_img_shape = self.observation_space["image"].shape
         self._frame_shape = single_img_shape
         if self._frame_stack > 1:
             self._frame_buffer: deque[np.ndarray] | None = deque(
@@ -128,10 +117,8 @@ class movingLavaEnv(MiniGridEnv):
 
         self.observation_space = gym.spaces.Dict({
             "image": gym.spaces.Box(low=0, high=255, shape=image_shape, dtype=np.uint8),
-            # 1 while a plan is being computed (delay not yet elapsed)
             "plan_computing": gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
-            # 1 once the completed plan has been delivered to the agent
-            "plan_ready": gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
+            "plan_ready":     gym.spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
         })
 
         self.plan: list[int] | None = None
@@ -139,101 +126,190 @@ class movingLavaEnv(MiniGridEnv):
         self.plan_request_pos: tuple[int, int] | None = None
         self.plan_request_dir: int | None = None
 
+    # ------------------------------------------------------------------
+    # Grid layout helpers
+    # ------------------------------------------------------------------
+
+    def _compute_street_positions(self) -> None:
+        """Populate _street_cols and _street_rows for the current grid_size."""
+        period = self.block_size + 1
+        self._street_cols = list(range(1, self.grid_size - 1, period))
+        self._street_rows = list(range(1, self.grid_size - 1, period))
+
+    def _is_street_col(self, x: int) -> bool:
+        return x in self._street_col_set
+
+    def _is_street_row(self, y: int) -> bool:
+        return y in self._street_row_set
+
+    def _is_street_cell(self, x: int, y: int) -> bool:
+        return self._is_street_col(x) or self._is_street_row(y)
+
+    def _is_intersection(self, x: int, y: int) -> bool:
+        return self._is_street_col(x) and self._is_street_row(y)
+
+    # ------------------------------------------------------------------
+    # Grid generation
+    # ------------------------------------------------------------------
 
     def _gen_grid(self, width: int, height: int) -> None:
         self.grid = Grid(width, height)
         self.grid.wall_rect(0, 0, width, height)
 
-        # Agent always starts in the middle of the left side, facing right
-        agent_y = height // 2
-        self.agent_pos = np.array([1, agent_y])
-        self.agent_dir = 0  # right
+        self._compute_street_positions()
+        self._street_col_set = set(self._street_cols)
+        self._street_row_set = set(self._street_rows)
 
-        # Goal: random interior y on the right side
-        goal_y = int(self.np_random.integers(1, height - 1))
-        self.grid.set(width - 2, goal_y, Goal())
-        self._goal_pos = (width - 2, goal_y)
+        # Place walls for every city block interior cell
+        for x in range(1, width - 1):
+            for y in range(1, height - 1):
+                if not self._is_street_cell(x, y):
+                    self.grid.set(x, y, Wall())
 
+        # All intersections are always clear (street × street)
+        intersections = [(x, y) for x in self._street_cols for y in self._street_rows]
+        n = len(intersections)
+
+        # Pick start and goal separated by at least min_goal_dist hops
+        nc = len(self._street_cols)
+        nr = len(self._street_rows)
+        start_ci = int(self.np_random.integers(0, nc))
+        start_ri = int(self.np_random.integers(0, nr))
+        for _ in range(200):
+            goal_ci = int(self.np_random.integers(0, nc))
+            goal_ri = int(self.np_random.integers(0, nr))
+            dist = abs(goal_ci - start_ci) + abs(goal_ri - start_ri)
+            if dist >= max(self.min_goal_dist, 1):
+                break
+
+        sx, sy = self._street_cols[start_ci], self._street_rows[start_ri]
+        gx, gy = self._street_cols[goal_ci], self._street_rows[goal_ri]
+
+        self.agent_pos = np.array([sx, sy])
+        self.agent_dir = 0  # facing right
+
+        self.grid.set(gx, gy, Goal())
+        self._goal_pos = (gx, gy)
         self.mission = "reach the green goal"
 
+        # Scatter lava, guaranteeing at least one safe route
+        self._generate_lava((sx, sy), (gx, gy))
 
-    def _generate_lava_lines(self) -> None:
-        """Scatter vertical lava strips across the grid interior.
+    # ------------------------------------------------------------------
+    # Lava generation
+    # ------------------------------------------------------------------
 
-        Strips are generated left-to-right.  The x gap between consecutive
-        strips is drawn from [min_x_gap, max_x_gap] and the y-center wanders
-        by [min_y_gap, max_y_gap] each step so lines are spread vertically.
-        Each strip is assigned a random up/down direction for this episode.
+    def _random_intersection_path(
+        self, start: tuple[int, int], goal: tuple[int, int]
+    ) -> list[tuple[int, int]]:
+        """Random DFS over intersection graph; returns a non-optimal winding path.
+
+        At each intersection the four cardinal neighbours are shuffled before
+        exploration, so the safe route is unpredictable and typically much
+        longer than the Manhattan-optimal route.  Backtracking guarantees the
+        goal is always reached on the fully-connected grid.
         """
-        w = self.width
-        h = self.height
-        lines: list[list] = []
+        sc = self._street_cols
+        sr = self._street_rows
+        col_idx = {c: i for i, c in enumerate(sc)}
+        row_idx = {r: i for i, r in enumerate(sr)}
 
-        # First strip x: at least min_x_gap from the left wall
-        x = 1 + int(self.np_random.integers(self.min_x_gap, self.max_x_gap + 1))
-        y_center = int(self.np_random.integers(1, h - 1))
+        deltas = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
-        while x <= w - 3:  # leave at least one empty column before the right wall
-            length = int(self.np_random.integers(self.min_lava_len, self.max_lava_len + 1))
+        # Each stack frame: (current node, iterator over unvisited neighbours)
+        visited = {start}
+        path = [start]
 
-            # Clamp length so the strip fits inside the interior rows [1, h-2]
-            max_y_top = h - 1 - length      # y_top + length - 1 <= h - 2
-            if max_y_top < 1:
-                length = h - 2
-                max_y_top = 1
+        def neighbours(cx: int, cy: int):
+            ci, ri = col_idx[cx], row_idx[cy]
+            order = self.np_random.permutation(len(deltas))
+            for idx in order:
+                di, dj = deltas[idx]
+                ni, nj = ci + di, ri + dj
+                if 0 <= ni < len(sc) and 0 <= nj < len(sr):
+                    nb = (sc[ni], sr[nj])
+                    if nb not in visited:
+                        yield nb
 
-            y_top = int(self.np_random.integers(1, max_y_top + 1))
-            direction = 1 if self.np_random.random() < 0.5 else -1
-            lines.append([x, y_top, length, direction])
+        stack: list = [neighbours(start[0], start[1])]
 
-            # Advance to the next strip position
-            x_gap = int(self.np_random.integers(self.min_x_gap, self.max_x_gap + 1))
-            y_gap = int(self.np_random.integers(self.min_y_gap, self.max_y_gap + 1))
-            x += x_gap
-            y_sign = 1 if self.np_random.random() < 0.5 else -1
-            y_center = max(1, min(h - 2, y_center + y_sign * y_gap))
+        while stack:
+            try:
+                nb = next(stack[-1])
+                visited.add(nb)
+                path.append(nb)
+                if nb == goal:
+                    return path
+                stack.append(neighbours(nb[0], nb[1]))
+            except StopIteration:
+                stack.pop()
+                if path:
+                    path.pop()
 
-        self._lava_lines = lines
+        return [start]  # unreachable on a connected grid
 
-    def _update_lava_cells(self) -> None:
-        """Sync `lava_cells` and the underlying grid with current `_lava_lines`."""
-        # Erase old lava from the grid
-        for x, y in self.lava_cells:
-            cell = self.grid.get(x, y)
-            if cell is not None and cell.type == "lava":
-                self.grid.set(x, y, None)
+    def _segment_cells(
+        self, a: tuple[int, int], b: tuple[int, int]
+    ) -> list[tuple[int, int]]:
+        """All grid cells (inclusive) on the straight segment between adjacent intersections."""
+        ax, ay = a
+        bx, by = b
+        if ax == bx:
+            return [(ax, y) for y in range(min(ay, by), max(ay, by) + 1)]
+        return [(x, ay) for x in range(min(ax, bx), max(ax, bx) + 1)]
+
+    def _generate_lava(
+        self, start: tuple[int, int], goal: tuple[int, int]
+    ) -> None:
+        """Scatter lava on street-segment cells, keeping one path guaranteed safe."""
+        # Cells along the guaranteed path must stay lava-free
+        path = self._random_intersection_path(start, goal)
+        protected: set[tuple[int, int]] = set()
+        for i in range(len(path) - 1):
+            protected.update(self._segment_cells(path[i], path[i + 1]))
+        protected.add(start)
+        protected.add(goal)
+
+        intersection_set = set(
+            (x, y) for x in self._street_cols for y in self._street_rows
+        )
+
         self.lava_cells = set()
-
-        gx, gy = self._goal_pos
-        for line in self._lava_lines:
-            x, y_top, length, _ = line
-            for dy in range(length):
-                cy = y_top + dy
-                if not (1 <= x <= self.width - 2 and 1 <= cy <= self.height - 2):
+        for x in range(1, self.width - 1):
+            for y in range(1, self.height - 1):
+                if not self._is_street_cell(x, y):
+                    continue   # city block interior — already a Wall
+                if (x, y) in protected:
                     continue
-                if (x, cy) == (gx, gy):
-                    continue  # never overwrite the goal
-                self.grid.set(x, cy, Lava())
-                self.lava_cells.add((x, cy))
+                if (x, y) in intersection_set:
+                    continue   # never block intersections with lava
+                if self.np_random.random() < self.lava_density:
+                    self.grid.set(x, y, Lava())
+                    self.lava_cells.add((x, y))
 
-    def _move_lava(self) -> None:
-        """Advance each strip one cell in its direction, bouncing at the walls."""
-        h = self.height
-        for line in self._lava_lines:
-            x, y_top, length, direction = line
-            new_y_top = y_top + direction
+    # ------------------------------------------------------------------
+    # Seen-lava tracking
+    # ------------------------------------------------------------------
 
-            # Clamp and reverse direction on boundary contact
-            clamped = max(1, min(new_y_top, h - 1 - length))
-            if clamped != new_y_top:
-                line[3] = -direction  # bounce
-            line[1] = clamped
+    def _update_seen_lava(self) -> None:
+        """Add any lava cells that fall inside the agent's view rectangle."""
+        topX, topY, botX, botY = self.get_view_exts()
+        for wx in range(topX, botX):
+            for wy in range(topY, botY):
+                if 0 <= wx < self.width and 0 <= wy < self.height:
+                    cell = self.grid.get(wx, wy)
+                    if cell is not None and cell.type == "lava":
+                        self.seen_lava.add((wx, wy))
+
+    # ------------------------------------------------------------------
+    # Gymnasium interface
+    # ------------------------------------------------------------------
 
     def reset(self, *args, **kwargs):
         self.time = 0
         self.plan_started_at = None
         self.lava_cells = set()
-        self._lava_lines = []
+        self.seen_lava = set()
         self.plan = None
         self.plan_path = []
         self.plan_request_pos = None
@@ -241,8 +317,8 @@ class movingLavaEnv(MiniGridEnv):
 
         obs, info = super().reset(*args, **kwargs)
 
-        self._generate_lava_lines()
-        self._update_lava_cells()
+        # Reveal lava visible from the starting position
+        self._update_seen_lava()
 
         first_frame = obs["image"]
         if self._frame_stack > 1:
@@ -256,17 +332,11 @@ class movingLavaEnv(MiniGridEnv):
     def step(self, action):
         self.time += 1
 
-        # Move lava before processing the action
-        self._move_lava()
-        self._update_lava_cells()
-
-        # If lava entered the agent's cell, end the episode immediately
-        if tuple(self.agent_pos) in self.lava_cells:
-            image_obs = self.gen_obs()["image"]
-            return self._make_obs(image_obs), 0.0, True, False, {"lava_death": True}
-
         # Deliver a pending plan once the delay has elapsed
-        if self.plan_started_at is not None and self.time - self.plan_started_at >= self.plan_delay:
+        if (
+            self.plan_started_at is not None
+            and self.time - self.plan_started_at >= self.plan_delay
+        ):
             if self.plan is not None:
                 self.plan_path = self._actions_to_world_coords(
                     self.plan_request_pos, self.plan_request_dir, self.plan
@@ -276,23 +346,24 @@ class movingLavaEnv(MiniGridEnv):
             self.plan_started_at = None
 
         if action == 3:
-            # Request a plan
             self.plan_started_at = self.time
             self.plan_request_pos = tuple(self.agent_pos)
             self.plan_request_dir = self.agent_dir
             self.plan = self.get_plan()
-
             image_obs = self.gen_obs()["image"]
-            return self._make_obs(image_obs), 0.0, False, self.time >= self.max_steps, {}
+            reward = -0.01
+            return self._make_obs(image_obs), reward, False, self.time >= self.max_steps, {}
 
         obs, reward, terminated, truncated, info = super().step(action)
-    
+
+        # Expand the seen-lava cache after the agent has moved
+        self._update_seen_lava()
+
         truncated = self.time >= self.max_steps
         reward = 1.0 if terminated and reward > 0 else 0.0
         return self._make_obs(obs["image"]), reward, terminated, truncated, info
-    
+
     def _make_obs(self, image: np.ndarray) -> dict:
-        """Build the dict observation from a raw agent-POV image array."""
         if self._frame_buffer is not None:
             self._frame_buffer.append(image)
             obs_image = np.concatenate(list(self._frame_buffer), axis=-1)
@@ -308,9 +379,12 @@ class movingLavaEnv(MiniGridEnv):
             ),
         }
 
+    # ------------------------------------------------------------------
+    # Observation overlay
+    # ------------------------------------------------------------------
+
     def gen_obs(self):
         obs = super().gen_obs()
-
         if self.plan_path:
             image = obs["image"].copy()
             dirs = self._plan_directions() if self.path_dir_colors else None
@@ -324,11 +398,10 @@ class movingLavaEnv(MiniGridEnv):
                             dtype=np.uint8,
                         )
             obs["image"] = image
-
         return obs
 
     # ------------------------------------------------------------------
-    # Rendering helpers
+    # Rendering
     # ------------------------------------------------------------------
 
     def get_full_render(self, highlight, tile_size):
@@ -359,7 +432,6 @@ class movingLavaEnv(MiniGridEnv):
         return img
 
     def _plan_directions(self) -> list[int]:
-        """Return a direction-state int for every cell in plan_path."""
         path = self.plan_path
         out: list[int] = []
         for i, (wx, wy) in enumerate(path):
@@ -381,18 +453,17 @@ class movingLavaEnv(MiniGridEnv):
         cells: list[tuple[int, int]],
         cell_colors: list[np.ndarray] | None = None,
     ) -> np.ndarray:
-        """Return a copy of `img` with a semi-transparent colored overlay on each cell."""
         img = img.copy()
-        h, w = img.shape[:2]
         for i, (cx, cy) in enumerate(cells):
             color = cell_colors[i] if cell_colors is not None else _PATH_COLOR_RGB
             ymin, ymax = cy * tile_size, (cy + 1) * tile_size
             xmin, xmax = cx * tile_size, (cx + 1) * tile_size
-            if ymin < 0 or xmin < 0 or ymax > h or xmax > w:
+            if ymin < 0 or xmin < 0 or ymax > img.shape[0] or xmax > img.shape[1]:
                 continue
             patch = img[ymin:ymax, xmin:xmax].astype(np.float32)
-            patch = patch * (1 - _PATH_ALPHA) + color * _PATH_ALPHA
-            img[ymin:ymax, xmin:xmax] = patch.astype(np.uint8)
+            img[ymin:ymax, xmin:xmax] = (
+                patch * (1 - _PATH_ALPHA) + color * _PATH_ALPHA
+            ).astype(np.uint8)
         return img
 
     # ------------------------------------------------------------------
@@ -405,61 +476,43 @@ class movingLavaEnv(MiniGridEnv):
         start_dir: int,
         actions: list[int],
     ) -> list[tuple[int, int]]:
-        """Replay a list of actions and return every world cell entered by a forward move."""
         x, y = start_pos
         d = start_dir
         coords: list[tuple[int, int]] = []
         for action in actions:
-            if action == 0:      # turn left
+            if action == 0:
                 d = (d - 1) % 4
-            elif action == 1:    # turn right
+            elif action == 1:
                 d = (d + 1) % 4
-            else:                # forward
+            else:
                 dx, dy = _DIR_VECS[d]
                 x, y = x + dx, y + dy
                 coords.append((x, y))
         return coords
 
-    def _lava_buffer_cells(self, n: int) -> set[tuple[int, int]]:
-        """Return all cells within Manhattan distance n of any lava cell."""
-        if n <= 0 or not self.lava_cells:
-            return set()
-        buffer: set[tuple[int, int]] = set()
-        for lx, ly in self.lava_cells:
-            for dx in range(-n, n + 1):
-                rem = n - abs(dx)
-                for dy in range(-rem, rem + 1):
-                    nx, ny = lx + dx, ly + dy
-                    if 0 <= nx < self.width and 0 <= ny < self.height:
-                        buffer.add((nx, ny))
-        return buffer
-
     def _astar(
         self,
         pos: tuple,
         agent_dir: int,
-        output: str,
-        extra_blocked: set[tuple[int, int]],
+        output: str = "actions",
     ):
-        """Core A* over the (x, y, dir) state space.
+        """A* over (x, y, dir) state space using only seen_lava as obstacles.
 
-        extra_blocked: cells treated as unwalkable in addition to actual lava.
-        Returns the plan in the requested output format, or None if unreachable.
+        Unseen lava is treated as passable (Lava.can_overlap() == True), so
+        the planner may route through it.  Only lava cells the agent has
+        already observed are avoided.
         """
         gx, gy = self._goal_pos
 
-        def is_walkable(x, y):
+        def is_walkable(x: int, y: int) -> bool:
             if x < 0 or y < 0 or x >= self.width or y >= self.height:
                 return False
-            if not self.planner_ignores_lava:
-                if (x, y) in self.lava_cells:
-                    return False
-                if (x, y) in extra_blocked:
-                    return False
+            if (x, y) in self.seen_lava:
+                return False
             cell = self.grid.get(x, y)
             return cell is None or (x, y) == (gx, gy) or cell.can_overlap()
 
-        def heuristic(x, y):
+        def heuristic(x: int, y: int) -> int:
             return abs(x - gx) + abs(y - gy)
 
         start = (pos[0], pos[1], agent_dir)
@@ -474,8 +527,8 @@ class movingLavaEnv(MiniGridEnv):
             if (x, y) == (gx, gy):
                 if output == "actions":
                     return actions
-                directions = []
                 cur_d = agent_dir
+                directions = []
                 for a in actions:
                     if a == 0:
                         cur_d = (cur_d - 1) % 4
@@ -519,36 +572,25 @@ class movingLavaEnv(MiniGridEnv):
         return None
 
     def get_plan(self, pos=None, agent_dir=None, output="actions"):
-        """A* planner from the current position to the goal.
+        """A* from current position to goal, avoiding only seen lava.
 
-        When planner_ignores_lava is False (default): first tries a path that
-        stays at least `lava_buffer` Manhattan distance from lava, then falls
-        back to any lava-free path if the buffered route is unreachable.
-
-        When planner_ignores_lava is True: lava is treated as passable and the
-        planner simply finds the shortest path to the goal.
+        The planner has no knowledge of lava cells the agent has not yet
+        observed — those cells are treated as passable.  This means the
+        plan may route through hidden lava; the agent should re-plan upon
+        encountering unexpected obstacles.
 
         Args:
             pos:       (x, y) start; defaults to agent_pos.
             agent_dir: starting direction; defaults to self.agent_dir.
             output:    'actions'    → list of action ints (0=left,1=right,2=forward)
-                       'directions' → list of (dx, dy) move vectors (turns omitted)
+                       'directions' → list of (dx, dy) move vectors
 
         Returns:
-            Sequence in the requested format, or None if the goal is unreachable.
+            Sequence in the requested format, or None if the goal is unreachable
+            given the agent's current knowledge.
         """
         if pos is None:
             pos = self.agent_pos
         if agent_dir is None:
             agent_dir = self.agent_dir
-
-        if self.planner_ignores_lava:
-            return self._astar(pos, agent_dir, output, extra_blocked=set())
-
-        if self.lava_buffer > 0 and self.lava_cells:
-            buffer_cells = self._lava_buffer_cells(self.lava_buffer)
-            result = self._astar(pos, agent_dir, output, extra_blocked=buffer_cells)
-            if result is not None:
-                return result
-
-        return self._astar(pos, agent_dir, output, extra_blocked=set())
+        return self._astar(pos, agent_dir, output)

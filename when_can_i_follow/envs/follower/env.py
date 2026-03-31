@@ -77,6 +77,7 @@ class followerEnv(baseFourRoomsEnv):
         door_shift_prob: float = 0.0,
         frame_stack: int = 1,
         path_dir_colors: bool = True,
+        max_steps: int = 200,
         *args,
         **kwargs,
     ):
@@ -125,7 +126,7 @@ class followerEnv(baseFourRoomsEnv):
         # Max possible Manhattan distance within the walkable interior
         self._max_dist = float(self.width + self.height - 4)
 
-        self.max_steps = 200
+        self.max_steps = max_steps
 
     def _make_obs(self, image: np.ndarray) -> dict:
         if self.adversary_pos is not None:

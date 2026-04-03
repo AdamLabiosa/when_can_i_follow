@@ -32,3 +32,5 @@ Possibly a good domain: [https://github.com/waymo-research/waymax]
 ## Useful commands
 
 `python when_can_i_follow/train.py envs=basic`
+
+`python when_can_i_follow/train.py envs=city_block record.n_videos=10 train.total_timesteps=1000000 train.load_path=models/basic_env_model`

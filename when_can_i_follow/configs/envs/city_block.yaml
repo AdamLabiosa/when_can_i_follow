@@ -9,3 +9,4 @@ kwargs:
   path_dir_colors: true  # encode movement direction in path overlay colors
   min_goal_dist: 3       # minimum intersection-graph hops between start and goal
   max_steps: 100         # maximum steps per episode before truncation
+  lava_movement_prob: 0.0  # per-lava probability of moving one step each timestep

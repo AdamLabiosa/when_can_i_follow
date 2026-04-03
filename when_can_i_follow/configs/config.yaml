@@ -16,6 +16,7 @@ train:
   log_interval: 10
   load_path: null
   save_path: null
+  jax_platform: auto      # auto|cuda|cpu|tpu; auto prefers cuda,cpu fallback
 
 record:
   n_videos: 0          # set > 0 to record that many episodes after training

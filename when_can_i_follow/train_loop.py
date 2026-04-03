@@ -1,28 +1,28 @@
-"""Training loop: instantiates env from config, selects PPO policy, runs training."""
+"""Training loop: instantiates env from config and trains JAX PPO."""
 
 import logging
+import os
+from typing import TYPE_CHECKING
 
 import gymnasium as gym
 from gymnasium.wrappers import RecordVideo
 from omegaconf import DictConfig, OmegaConf
-from stable_baselines3 import PPO
-# from sbx import PPO
 
-from envs.basic.env import basicEnv
-from envs.city_block.env import cityBlockEnv
-from envs.follower.env import followerEnv
-from envs.lava.env import lavaEnv
-from envs.moving_lava.env import movingLavaEnv
-from envs.moving_openings.env import movingOpeningEnv
-from utils.training_utils import SmallCNN, SmallCNNCombinedExtractor, ActionTextOverlayWrapper
+from when_can_i_follow.envs.basic.env import basicEnv
+from when_can_i_follow.envs.city_block.env import cityBlockEnv
+from when_can_i_follow.envs.follower.env import followerEnv
+from when_can_i_follow.envs.lava.env import lavaEnv
+from when_can_i_follow.envs.moving_lava.env import movingLavaEnv
+from when_can_i_follow.envs.moving_openings.env import movingOpeningEnv
+from when_can_i_follow.utils.training_utils import ActionTextOverlayWrapper
+
+if TYPE_CHECKING:
+    from when_can_i_follow.cleanrl_base import JaxPPOModel
 
 log = logging.getLogger(__name__)
 
-# NatureCNN's first conv has an 8×8 kernel — images smaller than this need a custom CNN
-_NATURE_CNN_MIN_SIZE = 36
 
-
-def record_videos(model: PPO, cfg: DictConfig) -> None:
+def record_videos(model: "JaxPPOModel", cfg: DictConfig) -> None:
     """Roll out the trained model and save N episodes as mp4 files."""
     r = cfg.record
     n = r.n_videos
@@ -73,81 +73,74 @@ def make_env(cfg: DictConfig, render_mode: str | None = None) -> gym.Env:
         raise KeyError(f"Unknown env '{env_name}'.")
 
 
-def select_policy(obs_space: gym.Space) -> tuple[str, dict]:
-    """Return (policy_str, policy_kwargs) for the given observation space.
-
-    - Dict obs with small image       → MultiInputPolicy + SmallCNNCombinedExtractor
-    - Dict obs with large image       → MultiInputPolicy (default NatureCNN)
-    - 3-D Box, spatial dims ≥ 36     → CnnPolicy with default NatureCNN
-    - 3-D Box, spatial dims < 36     → CnnPolicy with SmallCNN extractor
-    - Everything else                 → MlpPolicy
-    """
-    if isinstance(obs_space, gym.spaces.Dict):
-        # Check if any image subspace is too small for NatureCNN
-        needs_small_cnn = any(
-            isinstance(subspace, gym.spaces.Box)
-            and len(subspace.shape) == 3
-            and (subspace.shape[0] < _NATURE_CNN_MIN_SIZE or subspace.shape[1] < _NATURE_CNN_MIN_SIZE)
-            for subspace in obs_space.spaces.values()
-        )
-        if needs_small_cnn:
-            return "MultiInputPolicy", {"features_extractor_class": SmallCNNCombinedExtractor}
-        return "MultiInputPolicy", {}
-    if isinstance(obs_space, gym.spaces.Box) and len(obs_space.shape) >= 3:
-        h, w = obs_space.shape[:2]
-        if h < _NATURE_CNN_MIN_SIZE or w < _NATURE_CNN_MIN_SIZE:
-            return "CnnPolicy", {"features_extractor_class": SmallCNN}
-        return "CnnPolicy", {}
-    return "MlpPolicy", {}
-
-
-def train(cfg: DictConfig) -> PPO:
-    env = make_env(cfg)
-    policy, policy_kwargs = select_policy(env.observation_space)
-
-    log.info("Env: %s  |  obs_space: %s", cfg.env.name, env.observation_space)
-    log.info("Selected policy: %s", policy)
-
+def train(cfg: DictConfig) -> "JaxPPOModel":
     t = cfg.train
+    # Platform selection happens before importing JAX modules.
+    # auto -> prefer CUDA, then fall back to CPU.
+    jax_platform = str(t.get("jax_platform", "auto")).strip().lower()
+    if jax_platform == "auto":
+        if "JAX_PLATFORMS" not in os.environ:
+            os.environ["JAX_PLATFORMS"] = "cuda,cpu"
+        log.info("Using JAX platform preference: %s", os.environ["JAX_PLATFORMS"])
+    elif jax_platform:
+        os.environ["JAX_PLATFORMS"] = jax_platform
+        log.info("Using JAX platform: %s", jax_platform)
+
+    from when_can_i_follow.cleanrl_base import JaxPPOConfig, JaxPPOModel
+
+    num_envs = int(t.get("num_envs", 1))
+    seed = int(t.get("seed", 1))
+    envs = gym.vector.SyncVectorEnv([lambda: make_env(cfg) for _ in range(num_envs)])
+    log.info("Env: %s  |  obs_space: %s", cfg.env.name, envs.single_observation_space)
+
+    ppo_cfg = JaxPPOConfig(
+        n_steps=int(t.n_steps),
+        batch_size=int(t.batch_size),
+        n_epochs=int(t.n_epochs),
+        learning_rate=float(t.learning_rate),
+        gamma=float(t.gamma),
+        gae_lambda=float(t.gae_lambda),
+        clip_range=float(t.clip_range),
+        ent_coef=float(t.ent_coef),
+        vf_coef=float(t.get("vf_coef", 0.5)),
+        max_grad_norm=float(t.get("max_grad_norm", 0.5)),
+        num_envs=num_envs,
+    )
+    model = JaxPPOModel(envs=envs, cfg=ppo_cfg, seed=seed)
+
     load_path = t.get("load_path")
     if load_path:
         finetune_lr = t.get("finetune_lr")
-        lr = finetune_lr if finetune_lr is not None else t.learning_rate
+        lr = float(finetune_lr) if finetune_lr is not None else float(t.learning_rate)
+        if lr != model.learning_rate:
+            ppo_cfg = JaxPPOConfig(
+                n_steps=ppo_cfg.n_steps,
+                batch_size=ppo_cfg.batch_size,
+                n_epochs=ppo_cfg.n_epochs,
+                learning_rate=lr,
+                gamma=ppo_cfg.gamma,
+                gae_lambda=ppo_cfg.gae_lambda,
+                clip_range=ppo_cfg.clip_range,
+                ent_coef=ppo_cfg.ent_coef,
+                vf_coef=ppo_cfg.vf_coef,
+                max_grad_norm=ppo_cfg.max_grad_norm,
+                num_envs=ppo_cfg.num_envs,
+            )
+            model = JaxPPOModel(envs=envs, cfg=ppo_cfg, seed=seed)
         log.info("Loading model from %s  |  learning_rate: %s", load_path, lr)
-        model = PPO.load(
-            load_path,
-            env=env,
-            device="cpu",
-            custom_objects={"learning_rate": lr},
-        )
-    else:
-        model = PPO(
-            policy=policy,
-            env=env,
-            policy_kwargs=policy_kwargs,
-            n_steps=t.n_steps,
-            batch_size=t.batch_size,
-            n_epochs=t.n_epochs,
-            learning_rate=t.learning_rate,
-            gamma=t.gamma,
-            gae_lambda=t.gae_lambda,
-            clip_range=t.clip_range,
-            ent_coef=t.ent_coef,
-            verbose=1,
-            device="cpu",
-        )
+        model.load(load_path, reset_optimizer=finetune_lr is not None)
 
     model.learn(
-        total_timesteps=t.total_timesteps,
-        log_interval=t.log_interval,
+        total_timesteps=int(t.total_timesteps),
+        log_interval=int(t.log_interval),
     )
 
     save_path = t.get("save_path")
     if save_path:
         model.save(save_path)
-        log.info("Model saved to %s.zip", save_path)
+        log.info("Model saved to %s", save_path)
 
-    env.close()
+    envs.close()
 
     if cfg.record.n_videos > 0:
         record_videos(model, cfg)

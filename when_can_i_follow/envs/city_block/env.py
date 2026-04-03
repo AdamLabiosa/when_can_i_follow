@@ -73,6 +73,7 @@ class cityBlockEnv(MiniGridEnv):
         path_dir_colors: bool = True,
         min_goal_dist: int = 3,
         max_steps: int = 500,
+        lava_movement_prob: float = 0.0,
         **kwargs,
     ):
         self.grid_size = grid_size
@@ -82,6 +83,7 @@ class cityBlockEnv(MiniGridEnv):
         self._frame_stack = frame_stack
         self.path_dir_colors = path_dir_colors
         self.min_goal_dist = min_goal_dist
+        self.lava_movement_prob = lava_movement_prob
 
         # Runtime state — set before super().__init__ so _gen_grid runs safely
         self.lava_cells: set[tuple[int, int]] = set()
@@ -302,6 +304,70 @@ class cityBlockEnv(MiniGridEnv):
                         self.seen_lava.add((wx, wy))
 
     # ------------------------------------------------------------------
+    # Lava dynamics
+    # ------------------------------------------------------------------
+
+    def _step_lava(self) -> None:
+        """Move each lava tile independently with probability epsilon.
+
+        Each lava picks one random cardinal direction; if the target cell is a
+        valid (non-intersection) street cell that is not already occupied by
+        another lava, the goal, or the agent, the lava slides there.
+        Lavas are processed in a shuffled order so no single tile has priority.
+        """
+        if self.lava_movement_prob <= 0.0:
+            return
+
+        directions = [(1, 0), (0, 1), (-1, 0), (0, -1)]
+        agent_pos = tuple(self.agent_pos)
+
+        lava_list = list(self.lava_cells)
+        self.np_random.shuffle(lava_list)
+
+        # Work on a mutable copy so moves within the same step are respected.
+        occupied = set(self.lava_cells)
+
+        for (lx, ly) in lava_list:
+            if (lx, ly) not in occupied:
+                continue  # another lava slid here this step
+
+            if self.np_random.random() >= self.lava_movement_prob:
+                continue  # this lava stays put
+
+            di = int(self.np_random.integers(0, 4))
+            dx, dy = directions[di]
+            nx, ny = lx + dx, ly + dy
+
+            # Must stay inside the inner grid
+            if nx < 1 or ny < 1 or nx >= self.width - 1 or ny >= self.height - 1:
+                continue
+            # Must be a street cell (not a block interior)
+            if not self._is_street_cell(nx, ny):
+                continue
+            # Intersections are lava-free by convention
+            if self._is_intersection(nx, ny):
+                continue
+            # No overlap with another lava
+            if (nx, ny) in occupied:
+                continue
+            # Don't land on the goal or the agent
+            if (nx, ny) == self._goal_pos or (nx, ny) == agent_pos:
+                continue
+
+            # Commit the move
+            occupied.discard((lx, ly))
+            occupied.add((nx, ny))
+            self.grid.set(lx, ly, None)
+            self.grid.set(nx, ny, Lava())
+
+        self.lava_cells = occupied
+
+        # Seen-lava cache: drop entries where lava has since moved away,
+        # then reveal any lava that drifted into the agent's current view.
+        self.seen_lava = {pos for pos in self.seen_lava if pos in self.lava_cells}
+        self._update_seen_lava()
+
+    # ------------------------------------------------------------------
     # Gymnasium interface
     # ------------------------------------------------------------------
 
@@ -358,6 +424,10 @@ class cityBlockEnv(MiniGridEnv):
 
         # Expand the seen-lava cache after the agent has moved
         self._update_seen_lava()
+
+        # Stochastically drift lava tiles (no-op when epsilon == 0)
+        if not terminated:
+            self._step_lava()
 
         truncated = self.time >= self.max_steps
         reward = 1.0 if terminated and reward > 0 else 0.0
